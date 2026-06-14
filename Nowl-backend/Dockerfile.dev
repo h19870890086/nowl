@@ -1,0 +1,22 @@
+# ==================== 开发环境 Dockerfile ====================
+
+# 阶段1：基础开发环境
+FROM maven:3.9-eclipse-temurin-17 AS base
+WORKDIR /app
+
+# 复制 Maven 镜像配置
+COPY settings.local.xml /root/.m2/settings.xml
+
+# 安装工具
+RUN apt-get update && apt-get install -y vim curl net-tools iputils-ping && rm -rf /var/lib/apt/lists/*
+
+# 设置时区
+RUN apt-get update && apt-get install -y tzdata && \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
+EXPOSE 8080 5005
+
+# 默认工作目录
+WORKDIR /app

@@ -1,0 +1,907 @@
+package com.unimarket.module.errand.service.impl;
+
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.util.StrUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.unimarket.common.config.RocketMQConfig;
+import com.unimarket.common.enums.DisputeStatus;
+import com.unimarket.common.enums.DisputeTargetType;
+import com.unimarket.common.enums.ErrandStatus;
+import com.unimarket.common.enums.NoticeType;
+import com.unimarket.common.enums.ReviewStatus;
+import com.unimarket.common.exception.BusinessException;
+import com.unimarket.common.mq.ErrandAuditMessage;
+import com.unimarket.common.mq.ErrandSyncMessage;
+import com.unimarket.common.constant.CacheConstants;
+import com.unimarket.common.result.PageQuery;
+import com.unimarket.common.result.ResultCode;
+import com.unimarket.common.utils.RedisCache;
+import com.unimarket.module.dispute.entity.DisputeRecord;
+import com.unimarket.module.dispute.mapper.DisputeRecordMapper;
+import com.unimarket.module.errand.dto.ErrandPublishDTO;
+import com.unimarket.module.errand.dto.ErrandQueryDTO;
+import com.unimarket.module.errand.dto.LocationUploadDTO;
+import com.unimarket.module.errand.entity.ErrandTask;
+import com.unimarket.module.errand.mapper.ErrandTaskMapper;
+import com.unimarket.module.errand.service.ErrandDelayMessageService;
+import com.unimarket.module.errand.service.ErrandService;
+import com.unimarket.module.errand.vo.ErrandVO;
+import com.unimarket.module.notice.service.NoticeService;
+import com.unimarket.module.risk.dto.RiskContext;
+import com.unimarket.module.risk.enums.RiskEventType;
+import com.unimarket.module.risk.service.RiskControlService;
+import com.unimarket.module.school.entity.SchoolInfo;
+import com.unimarket.module.school.mapper.SchoolInfoMapper;
+import com.unimarket.module.user.entity.UserInfo;
+import com.unimarket.module.user.mapper.UserInfoMapper;
+import com.unimarket.module.user.service.UserService;
+import com.unimarket.security.UserContextHolder;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+/**
+ * 跑腿任务Service实现类
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ErrandServiceImpl implements ErrandService {
+
+    private static final String ERRAND_SYNC_TOPIC = "errand-sync-topic";
+
+    private final ErrandTaskMapper errandTaskMapper;
+    private final UserInfoMapper userInfoMapper;
+    private final UserService userService;
+    private final SchoolInfoMapper schoolInfoMapper;
+    private final NoticeService noticeService;
+    private final DisputeRecordMapper disputeRecordMapper;
+    private final RedissonClient redissonClient;
+    private final ErrandDelayMessageService errandDelayMessageService;
+    private final RocketMQTemplate rocketMQTemplate;
+    private final RiskControlService riskControlService;
+    private final RedisCache redisCache;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void publishErrand(Long userId, ErrandPublishDTO dto) {
+        // 权限校验已在Controller层通过@PreAuthorize完成
+        UserInfo user = userInfoMapper.selectById(userId);
+        if (user == null) {
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+        // 校区合法性校验
+        LambdaQueryWrapper<SchoolInfo> schoolWrapper = new LambdaQueryWrapper<>();
+        schoolWrapper.eq(SchoolInfo::getSchoolCode, dto.getSchoolCode())
+                .eq(SchoolInfo::getCampusCode, dto.getCampusCode())
+                .eq(SchoolInfo::getStatus, 1);
+        SchoolInfo schoolInfo = schoolInfoMapper.selectOne(schoolWrapper);
+        if (schoolInfo == null) {
+            throw new BusinessException("校区信息不存在或已停用");
+        }
+        Map<String, Object> features = new HashMap<>();
+        features.put("reward", dto.getReward());
+        features.put("titleLength", dto.getTitle() == null ? 0 : dto.getTitle().length());
+        Map<String, Object> rawPayload = new HashMap<>();
+        rawPayload.put("title", dto.getTitle());
+        rawPayload.put("taskContent", dto.getTaskContent());
+        rawPayload.put("pickupAddress", dto.getPickupAddress());
+        rawPayload.put("deliveryAddress", dto.getDeliveryAddress());
+        rawPayload.put("reward", dto.getReward());
+        rawPayload.put("publisherId", userId);
+        riskControlService.assertAllowed(RiskContext.builder()
+                .eventType(RiskEventType.ERRAND_PUBLISH)
+                .userId(userId)
+                .subjectId(String.valueOf(userId))
+                .schoolCode(dto.getSchoolCode())
+                .campusCode(dto.getCampusCode())
+                .features(features)
+                .rawPayload(rawPayload)
+                .build());
+
+        ErrandTask task = BeanUtil.copyProperties(dto, ErrandTask.class);
+
+        // 检查余额
+        if (user.getMoney().compareTo(task.getReward()) < 0) {
+            throw new BusinessException("余额不足，无法发布悬赏任务");
+        }
+
+        // 原子扣除余额（资金托管），并刷新缓存确保前端立即获取最新余额
+        userInfoMapper.addMoney(userId, task.getReward().negate());
+        userService.refreshUserCache(userId);
+        task.setPublisherId(userId);
+        task.setTaskStatus(ErrandStatus.PENDING.getCode());
+        task.setSchoolCode(dto.getSchoolCode());
+        task.setCampusCode(dto.getCampusCode());
+        task.setPickupLatitude(null);
+        task.setPickupLongitude(null);
+        task.setDeliveryLatitude(null);
+        task.setDeliveryLongitude(null);
+        task.setReviewStatus(ReviewStatus.WAIT_REVIEW.getCode());
+        task.setAuditReason(null);
+        if (dto.getDeadline() != null && !dto.getDeadline().isEmpty()) {
+            try {
+                task.setDeadline(LocalDateTime.parse(dto.getDeadline(),
+                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+            } catch (Exception e) {
+                // 尝试其他格式
+                try {
+                    task.setDeadline(LocalDateTime.parse(dto.getDeadline(),
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")));
+                } catch (Exception ex) {
+                    log.warn("解析截止时间失败: {}", dto.getDeadline());
+                }
+            }
+        }
+        errandTaskMapper.insert(task);
+        evictErrandDetailCache(task.getTaskId(), task.getSchoolCode());
+        log.info("发布跑腿任务成功: taskId={}, userId={}, reward={}, reviewStatus={}",
+                task.getTaskId(), userId, task.getReward(), task.getReviewStatus());
+
+        // 提交后异步审核，通过后再同步 ES 并通知
+        sendErrandAuditAfterCommit(task.getTaskId(), ErrandAuditMessage.create(task.getTaskId()), "发布");
+    }
+
+    @Override
+    public Page<ErrandVO> getErrandList(ErrandQueryDTO dto) {
+        Page<ErrandTask> page = new Page<>(dto.getPageNum(), dto.getPageSize());
+        LambdaQueryWrapper<ErrandTask> wrapper = new LambdaQueryWrapper<>();
+
+        if (dto.getTaskStatus() != null) {
+            wrapper.eq(ErrandTask::getTaskStatus, dto.getTaskStatus());
+        }
+        if (dto.getKeyword() != null && !dto.getKeyword().isEmpty()) {
+            wrapper.and(w -> w.like(ErrandTask::getTitle, dto.getKeyword())
+                    .or().like(ErrandTask::getDescription, dto.getKeyword()));
+        }
+        if (StrUtil.isNotBlank(dto.getSchoolCode())) {
+            wrapper.eq(ErrandTask::getSchoolCode, dto.getSchoolCode());
+        }
+        if (StrUtil.isNotBlank(dto.getCampusCode())) {
+            wrapper.eq(ErrandTask::getCampusCode, dto.getCampusCode());
+        }
+        wrapper.in(ErrandTask::getReviewStatus, ReviewStatus.AI_PASSED.getCode(), ReviewStatus.MANUAL_PASSED.getCode());
+        wrapper.orderByDesc(ErrandTask::getCreateTime);
+
+        Page<ErrandTask> taskPage = errandTaskMapper.selectPage(page, wrapper);
+
+        Page<ErrandVO> voPage = new Page<>(taskPage.getCurrent(), taskPage.getSize(), taskPage.getTotal());
+        voPage.setRecords(convertToVOList(taskPage.getRecords()));
+
+        return voPage;
+    }
+
+    @Override
+    public ErrandVO getErrandDetail(Long taskId) {
+        String cacheKey = buildErrandDetailCacheKeyForRead(taskId);
+        if (cacheKey != null) {
+            ErrandVO cached = redisCache.get(cacheKey, ErrandVO.class);
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        ErrandTask task = errandTaskMapper.selectById(taskId);
+        if (task == null) {
+            throw new BusinessException(ResultCode.PARAM_IS_INVALID);
+        }
+        if (!isReviewPassed(task.getReviewStatus())) {
+            Long currentUserId = UserContextHolder.getUserId();
+            if (currentUserId == null || !currentUserId.equals(task.getPublisherId())) {
+                throw new BusinessException("任务不存在或未通过审核");
+            }
+            // 未审核通过：不缓存，避免不同用户请求间复用导致信息泄露
+            return convertToVO(task);
+        }
+
+        ErrandVO vo = convertToVO(task);
+        // 已审核通过：允许缓存（带抖动防雪崩）。注意：缓存 key 必须带 tenant（schoolCode），避免绕过多租户过滤。
+        if (cacheKey != null) {
+            redisCache.setWithJitter(cacheKey, vo, CacheConstants.ERRAND_DETAIL_EXPIRE, 10);
+        }
+        return vo;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void updateErrand(Long userId, Long taskId, ErrandPublishDTO dto) {
+        ErrandTask task = errandTaskMapper.selectById(taskId);
+        if (task == null) {
+            throw new BusinessException("任务不存在");
+        }
+        if (!task.getPublisherId().equals(userId)) {
+            throw new BusinessException("无权限修改该任务");
+        }
+        if (!ErrandStatus.PENDING.getCode().equals(task.getTaskStatus())) {
+            throw new BusinessException("仅待接单状态可修改");
+        }
+
+        UserInfo publisher = userInfoMapper.selectById(userId);
+        if (publisher == null) {
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+
+        if (dto.getReward() == null || dto.getReward().compareTo(java.math.BigDecimal.ZERO) <= 0) {
+            throw new BusinessException("报酬金额不合法");
+        }
+
+        java.math.BigDecimal oldReward = task.getReward();
+        java.math.BigDecimal escrowedReward = ReviewStatus.REJECTED.getCode().equals(task.getReviewStatus())
+                ? java.math.BigDecimal.ZERO
+                : oldReward;
+        java.math.BigDecimal newReward = dto.getReward();
+        int cmp = newReward.compareTo(escrowedReward);
+        if (cmp > 0) {
+            java.math.BigDecimal diff = newReward.subtract(escrowedReward);
+            if (publisher.getMoney().compareTo(diff) < 0) {
+                throw new BusinessException("余额不足，无法提高悬赏金额");
+            }
+            // 原子扣款+刷新缓存
+            userInfoMapper.addMoney(userId, diff.negate());
+            userService.refreshUserCache(userId);
+        } else if (cmp < 0) {
+            java.math.BigDecimal diff = escrowedReward.subtract(newReward);
+            // 原子退款+刷新缓存
+            userInfoMapper.addMoney(userId, diff);
+            userService.refreshUserCache(userId);
+        }
+
+        task.setTitle(dto.getTitle());
+        task.setDescription(dto.getDescription());
+        task.setTaskContent(dto.getTaskContent());
+        task.setImageList(dto.getImageList());
+        task.setPickupAddress(dto.getPickupAddress());
+        task.setPickupLatitude(null);
+        task.setPickupLongitude(null);
+        task.setDeliveryAddress(dto.getDeliveryAddress());
+        task.setDeliveryLatitude(null);
+        task.setDeliveryLongitude(null);
+        task.setReward(dto.getReward());
+        task.setRemark(dto.getRemark());
+        task.setReviewStatus(ReviewStatus.WAIT_REVIEW.getCode());
+        task.setAuditReason(null);
+
+        if (dto.getDeadline() != null && !dto.getDeadline().isEmpty()) {
+            try {
+                task.setDeadline(LocalDateTime.parse(dto.getDeadline(),
+                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+            } catch (Exception e) {
+                try {
+                    task.setDeadline(LocalDateTime.parse(dto.getDeadline(),
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")));
+                } catch (Exception ex) {
+                    log.warn("解析截止时间失败: {}", dto.getDeadline());
+                }
+            }
+        } else {
+            task.setDeadline(null);
+        }
+
+        errandTaskMapper.updateById(task);
+        evictErrandDetailCache(taskId, task.getSchoolCode());
+        log.info("跑腿任务修改成功: taskId={}, userId={}, reviewStatus={}", taskId, userId, task.getReviewStatus());
+
+        // 重新提审期间任务不可见：先从 ES 移除，审核通过后再恢复
+        sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.deleteMessage(taskId), "重新提审");
+        sendErrandAuditAfterCommit(taskId, ErrandAuditMessage.update(taskId), "修改");
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void acceptErrand(Long userId, Long taskId) {
+        // 分布式锁防止并发接单
+        String lockKey = "errand:lock:lifecycle:" + taskId;
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            boolean acquired = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new BusinessException("系统繁忙，请稍后重试");
+            }
+
+            // 权限校验已在Controller层通过@PreAuthorize完成
+            UserInfo user = userInfoMapper.selectById(userId);
+            if (user == null) {
+                throw new BusinessException(ResultCode.USER_NOT_FOUND);
+            }
+
+            ErrandTask task = errandTaskMapper.selectById(taskId);
+            if (task == null) {
+                throw new BusinessException("任务不存在");
+            }
+            if (!ErrandStatus.PENDING.getCode().equals(task.getTaskStatus())) {
+                throw new BusinessException("任务已被接单或已结束");
+            }
+            if (!isReviewPassed(task.getReviewStatus())) {
+                throw new BusinessException("任务尚未通过审核，暂不可接单");
+            }
+            if (task.getPublisherId().equals(userId)) {
+                throw new BusinessException("不能接自己发布的任务");
+            }
+
+            // 校园隔离：仅允许同学校接单（校区可不同）
+            String acceptorSchoolCode = user.getSchoolCode();
+            String taskSchoolCode = task.getSchoolCode();
+            if (StrUtil.isBlank(acceptorSchoolCode) || StrUtil.isBlank(taskSchoolCode)) {
+                throw new BusinessException("用户或任务学校信息缺失，暂不可接单");
+            }
+            if (!acceptorSchoolCode.trim().equalsIgnoreCase(taskSchoolCode.trim())) {
+                throw new BusinessException("仅支持同学校范围内接单");
+            }
+
+            Map<String, Object> features = new HashMap<>();
+            features.put("taskId", taskId);
+            features.put("reward", task.getReward());
+
+            Map<String, Object> rawPayload = new HashMap<>();
+            rawPayload.put("taskId", taskId);
+            rawPayload.put("acceptorId", userId);
+            rawPayload.put("publisherId", task.getPublisherId());
+            rawPayload.put("reward", task.getReward());
+            rawPayload.put("title", task.getTitle());
+
+            riskControlService.assertAllowed(RiskContext.builder()
+                    .eventType(RiskEventType.ERRAND_ACCEPT)
+                    .userId(userId)
+                    .subjectId(String.valueOf(userId))
+                    .schoolCode(task.getSchoolCode())
+                    .campusCode(task.getCampusCode())
+                    .features(features)
+                    .rawPayload(rawPayload)
+                    .build());
+
+            task.setAcceptorId(userId);
+            task.setTaskStatus(ErrandStatus.IN_PROGRESS.getCode());
+            task.setAcceptTime(LocalDateTime.now());
+            errandTaskMapper.updateById(task);
+            evictErrandDetailCache(taskId, task.getSchoolCode());
+
+            log.info("接单成功: taskId={}, acceptorId={}", taskId, userId);
+
+            // 通知发布者
+            noticeService.sendNotice(
+                    task.getPublisherId(),
+                    "跑腿任务已被接单",
+                    "您的任务 [" + task.getTitle() + "] 已被接单，跑腿员正在为您服务。",
+                    NoticeType.TRADE.getCode(),
+                    taskId
+            );
+
+            // 同步到ES
+            sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.updateMessage(taskId), "接单");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException("接单过程中断");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void deliverErrand(Long taskId, String evidenceImage) {
+        String lockKey = "errand:lock:lifecycle:" + taskId;
+        RLock lock = redissonClient.getLock(lockKey);
+        try {
+            boolean acquired = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new BusinessException("系统繁忙，请稍后重试");
+            }
+
+            ErrandTask task = errandTaskMapper.selectById(taskId);
+            if (task == null) {
+                throw new BusinessException("任务不存在");
+            }
+
+            // 权限验证已由 @PreAuthorize 在Controller层完成
+            if (!ErrandStatus.IN_PROGRESS.getCode().equals(task.getTaskStatus())) {
+                throw new BusinessException("当前任务状态不可送达");
+            }
+
+            if (task.getAcceptorId() == null) {
+                throw new BusinessException("任务未被接单，无法送达");
+            }
+
+            if (evidenceImage == null || evidenceImage.isEmpty()) {
+                throw new BusinessException("请上传送达凭证图片");
+            }
+
+            // 更新状态为待确认
+            task.setTaskStatus(ErrandStatus.PENDING_CONFIRM.getCode());
+            task.setEvidenceImage(evidenceImage);
+            task.setDeliverTime(LocalDateTime.now());
+            errandTaskMapper.updateById(task);
+            evictErrandDetailCache(taskId, task.getSchoolCode());
+
+            // 发送24小时自动确认延时消息
+            long deliverTimestamp = task.getDeliverTime().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+            runAfterCommit(() -> errandDelayMessageService.sendAutoConfirmMessage(taskId, deliverTimestamp));
+
+            log.info("跑腿任务送达: taskId={}, 已加入24小时自动确认队列", taskId);
+
+            // 通知发布者确认
+            noticeService.sendNotice(
+                    task.getPublisherId(),
+                    "跑腿任务已送达",
+                    "您的任务 [" + task.getTitle() + "] 跑腿员已送达，请确认收货。24小时后将自动确认。",
+                    NoticeType.TRADE.getCode(),
+                    taskId
+            );
+
+            // 同步到ES
+            sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.updateMessage(taskId), "送达");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException("送达过程中断");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void confirmErrand(Long taskId) {
+        String lockKey = "errand:lock:lifecycle:" + taskId;
+        RLock lock = redissonClient.getLock(lockKey);
+        try {
+            boolean acquired = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new BusinessException("系统繁忙，请稍后重试");
+            }
+
+            ErrandTask task = errandTaskMapper.selectById(taskId);
+            if (task == null) {
+                throw new BusinessException("任务不存在");
+            }
+
+            // 权限验证已由 @PreAuthorize 在Controller层完成
+            if (!ErrandStatus.PENDING_CONFIRM.getCode().equals(task.getTaskStatus())) {
+                throw new BusinessException("当前任务状态不可确认完成");
+            }
+
+            if (task.getAcceptorId() == null) {
+                throw new BusinessException("任务接单人不存在，无法结算");
+            }
+
+            // 结算佣金给接单人（原子操作+缓存刷新）
+            userInfoMapper.addMoney(task.getAcceptorId(), task.getReward());
+            userService.refreshUserCache(task.getAcceptorId());
+
+            // 更新状态为已完成
+            task.setTaskStatus(ErrandStatus.COMPLETED.getCode());
+            task.setConfirmTime(LocalDateTime.now());
+            errandTaskMapper.updateById(task);
+            evictErrandDetailCache(taskId, task.getSchoolCode());
+
+            log.info("跑腿任务确认完成: taskId={}, 佣金已结算 {}", taskId, task.getReward());
+
+            // 通知接单人
+            noticeService.sendNotice(
+                    task.getAcceptorId(),
+                    "佣金到账",
+                    "跑腿任务 [" + task.getTitle() + "] 已确认完成，佣金 ￥" + task.getReward() + " 已到账。",
+                    NoticeType.TRADE.getCode(),
+                    taskId
+            );
+
+            // 同步到ES
+            sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.updateMessage(taskId), "确认完成");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException("确认过程中断");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void cancelErrand(Long taskId, String reason) {
+        String lockKey = "errand:lock:lifecycle:" + taskId;
+        RLock lock = redissonClient.getLock(lockKey);
+        try {
+            boolean acquired = lock.tryLock(3, 10, TimeUnit.SECONDS);
+            if (!acquired) {
+                throw new BusinessException("系统繁忙，请稍后重试");
+            }
+
+            ErrandTask task = errandTaskMapper.selectById(taskId);
+            if (task == null) {
+                throw new BusinessException("任务不存在");
+            }
+
+            // 权限验证已由 @PreAuthorize 在Controller层完成
+            Integer status = task.getTaskStatus();
+            boolean canCancel = ErrandStatus.PENDING.getCode().equals(status)
+                    || ErrandStatus.IN_PROGRESS.getCode().equals(status);
+            if (!canCancel) {
+                throw new BusinessException("当前任务状态不可取消");
+            }
+            if (ReviewStatus.REJECTED.getCode().equals(task.getReviewStatus())) {
+                throw new BusinessException("任务审核未通过且悬赏已退还，无需重复取消");
+            }
+
+            Long currentUserId = UserContextHolder.getUserId();
+            if (currentUserId == null) {
+                throw new BusinessException(ResultCode.USER_NOT_LOGIN);
+            }
+            boolean isPublisher = currentUserId.equals(task.getPublisherId());
+            boolean isAcceptor = task.getAcceptorId() != null && currentUserId.equals(task.getAcceptorId());
+
+            // 接单人取消：视为放弃接单并重新上架（仅进行中状态允许）
+            if (isAcceptor && ErrandStatus.IN_PROGRESS.getCode().equals(status)) {
+                task.setAcceptorId(null);
+                task.setAcceptTime(null);
+                task.setTaskStatus(ErrandStatus.PENDING.getCode());
+                task.setCancelTime(null);
+                task.setCancelReason(null);
+                errandTaskMapper.updateById(task);
+                evictErrandDetailCache(taskId, task.getSchoolCode());
+
+                log.info("接单人放弃接单，任务重新上架: taskId={}, acceptorId={}", taskId, currentUserId);
+
+                // 通知发布者
+                noticeService.sendNotice(
+                        task.getPublisherId(),
+                        "接单人已放弃接单",
+                        "跑腿任务 [" + task.getTitle() + "] 的接单人已放弃接单，任务已重新上架，可继续等待其他跑腿员接单。",
+                        NoticeType.TRADE.getCode(),
+                        taskId
+                );
+
+                // 同步到ES（更新）
+                sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.updateMessage(taskId), "放弃接单");
+                return;
+            }
+
+            // 非发布者不允许把任务取消为“已取消”（接单人取消已在上方处理）
+            if (!isPublisher) {
+                throw new BusinessException("无权限取消该任务");
+            }
+
+            // 退还佣金给发布者（原子操作+缓存刷新）
+            userInfoMapper.addMoney(task.getPublisherId(), task.getReward());
+            userService.refreshUserCache(task.getPublisherId());
+
+            String normalizedReason = reason == null ? "" : reason.trim();
+            if (normalizedReason.isEmpty()) {
+                normalizedReason = "任务取消";
+            }
+
+            // 更新状态为已取消
+            task.setTaskStatus(ErrandStatus.CANCELLED.getCode());
+            task.setCancelTime(LocalDateTime.now());
+            task.setCancelReason(normalizedReason);
+            errandTaskMapper.updateById(task);
+            evictErrandDetailCache(taskId, task.getSchoolCode());
+
+            log.info("跑腿任务取消: taskId={}, reason={}", taskId, normalizedReason);
+
+            // 发送通知给双方
+            if (task.getAcceptorId() != null) {
+                noticeService.sendNotice(
+                        task.getAcceptorId(),
+                        "任务已取消",
+                        "跑腿任务 [" + task.getTitle() + "] 已取消。",
+                        NoticeType.TRADE.getCode(),
+                        taskId
+                );
+            }
+            noticeService.sendNotice(
+                    task.getPublisherId(),
+                    "任务已取消",
+                    "跑腿任务 [" + task.getTitle() + "] 已取消，佣金已退还。",
+                    NoticeType.TRADE.getCode(),
+                    taskId
+            );
+
+            // 同步到ES（删除）
+            sendErrandSyncAfterCommit(taskId, ErrandSyncMessage.deleteMessage(taskId), "取消");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException("取消过程中断");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Override
+    public Page<ErrandVO> getMyPublishedErrands(Long userId, PageQuery query) {
+        Page<ErrandTask> page = new Page<>(query.getPageNum(), query.getPageSize());
+        LambdaQueryWrapper<ErrandTask> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(ErrandTask::getPublisherId, userId).orderByDesc(ErrandTask::getCreateTime);
+
+        Page<ErrandTask> taskPage = errandTaskMapper.selectPage(page, wrapper);
+        Page<ErrandVO> voPage = new Page<>(taskPage.getCurrent(), taskPage.getSize(), taskPage.getTotal());
+        voPage.setRecords(convertToVOList(taskPage.getRecords()));
+        return voPage;
+    }
+
+    @Override
+    public Page<ErrandVO> getMyAcceptedErrands(Long userId, PageQuery query) {
+        Page<ErrandTask> page = new Page<>(query.getPageNum(), query.getPageSize());
+        LambdaQueryWrapper<ErrandTask> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(ErrandTask::getAcceptorId, userId).orderByDesc(ErrandTask::getCreateTime);
+
+        Page<ErrandTask> taskPage = errandTaskMapper.selectPage(page, wrapper);
+        Page<ErrandVO> voPage = new Page<>(taskPage.getCurrent(), taskPage.getSize(), taskPage.getTotal());
+        voPage.setRecords(convertToVOList(taskPage.getRecords()));
+        return voPage;
+    }
+
+    @Override
+    public void uploadLocation(Long userId, LocationUploadDTO dto) {
+        log.debug("位置上报已停用: userId={}, taskId={}", userId, dto.getTaskId());
+    }
+
+    @Override
+    public String getLocation(Long taskId) {
+        return null;
+    }
+
+    private boolean isReviewPassed(Integer reviewStatus) {
+        return ReviewStatus.AI_PASSED.getCode().equals(reviewStatus)
+                || ReviewStatus.MANUAL_PASSED.getCode().equals(reviewStatus);
+    }
+
+    private String buildErrandDetailCacheKeyForRead(Long taskId) {
+        if (taskId == null) {
+            return null;
+        }
+        // 游客可看全部：按 guest 维度缓存即可
+        if (UserContextHolder.isGuest()) {
+            return CacheConstants.ERRAND_DETAIL + "guest:" + taskId;
+        }
+        // 已登录用户：必须带 schoolCode，避免绕过多租户过滤
+        String schoolCode = UserContextHolder.getSchoolCode();
+        if (StrUtil.isBlank(schoolCode)) {
+            return null;
+        }
+        return CacheConstants.ERRAND_DETAIL + schoolCode.trim() + ":" + taskId;
+    }
+
+    private String buildErrandDetailCacheKeyForSchool(Long taskId, String schoolCode) {
+        if (taskId == null || StrUtil.isBlank(schoolCode)) {
+            return null;
+        }
+        return CacheConstants.ERRAND_DETAIL + schoolCode.trim() + ":" + taskId;
+    }
+
+    private String buildErrandDetailCacheKeyForGuest(Long taskId) {
+        if (taskId == null) {
+            return null;
+        }
+        return CacheConstants.ERRAND_DETAIL + "guest:" + taskId;
+    }
+
+    private void evictErrandDetailCache(Long taskId, String schoolCode) {
+        if (taskId == null) {
+            return;
+        }
+        String guestKey = buildErrandDetailCacheKeyForGuest(taskId);
+        if (guestKey != null) {
+            redisCache.delete(guestKey);
+        }
+        String schoolKey = buildErrandDetailCacheKeyForSchool(taskId, schoolCode);
+        if (schoolKey != null) {
+            redisCache.delete(schoolKey);
+        }
+    }
+
+    private void sendErrandSyncAfterCommit(Long taskId, ErrandSyncMessage message, String actionName) {
+        runAfterCommit(() -> {
+            try {
+                rocketMQTemplate.convertAndSend(ERRAND_SYNC_TOPIC, message);
+                log.info("发送跑腿任务{}同步消息成功: taskId={}, type={}", actionName, taskId, message.getType());
+            } catch (Exception e) {
+                log.error("发送跑腿任务{}同步消息失败: taskId={}, type={}", actionName, taskId, message.getType(), e);
+            }
+        });
+    }
+
+    private void sendErrandAuditAfterCommit(Long taskId, ErrandAuditMessage message, String actionName) {
+        runAfterCommit(() -> {
+            try {
+                rocketMQTemplate.syncSend(RocketMQConfig.ERRAND_AUDIT_TOPIC, message);
+                log.info("发送跑腿任务{}审核消息成功: taskId={}, operationType={}", actionName, taskId, message.getOperationType());
+            } catch (Exception e) {
+                log.error("发送跑腿任务{}审核消息失败: taskId={}, operationType={}", actionName, taskId, message.getOperationType(), e);
+            }
+        });
+    }
+
+    // 统一在事务提交后触发异步副作用，避免主事务回滚时消息已提前发出。
+    private void runAfterCommit(Runnable task) {
+        Runnable safeTask = () -> {
+            try {
+                task.run();
+            } catch (Exception e) {
+                log.error("事务提交后执行跑腿异步副作用失败", e);
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    safeTask.run();
+                }
+            });
+            return;
+        }
+        safeTask.run();
+    }
+
+    /**
+     * 实体转VO
+     */
+    private ErrandVO convertToVO(ErrandTask task) {
+        return convertToVOList(List.of(task)).get(0);
+    }
+
+    /**
+     * 批量实体转VO（解决N+1问题）
+     */
+    private List<ErrandVO> convertToVOList(List<ErrandTask> tasks) {
+        if (tasks == null || tasks.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        // 1. 收集所有相关的用户ID
+        Set<Long> userIds = new java.util.HashSet<>();
+        for (ErrandTask task : tasks) {
+            userIds.add(task.getPublisherId());
+            if (task.getAcceptorId() != null) {
+                userIds.add(task.getAcceptorId());
+            }
+        }
+
+        // 2. 批量查询用户信息
+        Map<Long, UserInfo> userMap = userInfoMapper.selectBatchIds(userIds).stream()
+                .collect(Collectors.toMap(UserInfo::getUserId, u -> u));
+
+        List<Long> taskIds = tasks.stream()
+                .map(ErrandTask::getTaskId)
+                .filter(java.util.Objects::nonNull)
+                .toList();
+        Map<Long, DisputeRecord> activeDisputeMap = buildActiveErrandDisputeMap(taskIds);
+        Map<Long, DisputeRecord> latestClosedDisputeMap = buildLatestClosedErrandDisputeMap(taskIds);
+
+        // 3. 转换并注入信息
+        return tasks.stream().map(task -> {
+            ErrandVO vo = BeanUtil.copyProperties(task, ErrandVO.class);
+
+            // 状态描述
+            ErrandStatus status = ErrandStatus.getByCode(task.getTaskStatus());
+            if (status != null) {
+                vo.setStatusText(status.getDescription());
+            }
+            ReviewStatus reviewStatus = ReviewStatus.getByCode(task.getReviewStatus());
+            if (reviewStatus != null) {
+                vo.setReviewStatusText(reviewStatus.getDescription());
+            }
+
+            // 发布者
+            UserInfo publisher = userMap.get(task.getPublisherId());
+            if (publisher != null) {
+                vo.setPublisherName(publisher.getNickName());
+                vo.setPublisherAvatar(publisher.getImageUrl());
+            }
+
+            // 接单者
+            if (task.getAcceptorId() != null) {
+                UserInfo acceptor = userMap.get(task.getAcceptorId());
+                if (acceptor != null) {
+                    vo.setAcceptorName(acceptor.getNickName());
+                    vo.setAcceptorAvatar(acceptor.getImageUrl());
+                }
+            }
+
+            fillActiveDisputeInfo(vo, activeDisputeMap);
+            fillLatestClosedDisputeInfo(vo, latestClosedDisputeMap);
+
+            return vo;
+        }).collect(Collectors.toList());
+    }
+
+    private Map<Long, DisputeRecord> buildActiveErrandDisputeMap(List<Long> taskIds) {
+        if (taskIds == null || taskIds.isEmpty()) {
+            return Map.of();
+        }
+        LambdaQueryWrapper<DisputeRecord> wrapper = new LambdaQueryWrapper<>();
+        wrapper.in(DisputeRecord::getContentId, taskIds)
+                .eq(DisputeRecord::getTargetType, DisputeTargetType.ERRAND.getCode())
+                .in(DisputeRecord::getHandleStatus, DisputeStatus.PENDING.getCode(), DisputeStatus.PROCESSING.getCode())
+                .orderByDesc(DisputeRecord::getCreateTime);
+        List<DisputeRecord> records = disputeRecordMapper.selectList(wrapper);
+        if (records.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, DisputeRecord> map = new HashMap<>();
+        for (DisputeRecord record : records) {
+            map.putIfAbsent(record.getContentId(), record);
+        }
+        return map;
+    }
+
+    private Map<Long, DisputeRecord> buildLatestClosedErrandDisputeMap(List<Long> taskIds) {
+        if (taskIds == null || taskIds.isEmpty()) {
+            return Map.of();
+        }
+        LambdaQueryWrapper<DisputeRecord> wrapper = new LambdaQueryWrapper<>();
+        wrapper.in(DisputeRecord::getContentId, taskIds)
+                .eq(DisputeRecord::getTargetType, DisputeTargetType.ERRAND.getCode())
+                .in(DisputeRecord::getHandleStatus,
+                        DisputeStatus.RESOLVED.getCode(),
+                        DisputeStatus.REJECTED.getCode())
+                .orderByDesc(DisputeRecord::getCreateTime);
+        List<DisputeRecord> records = disputeRecordMapper.selectList(wrapper);
+        if (records.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, DisputeRecord> map = new HashMap<>();
+        for (DisputeRecord record : records) {
+            map.putIfAbsent(record.getContentId(), record);
+        }
+        return map;
+    }
+
+    private void fillActiveDisputeInfo(ErrandVO vo, Map<Long, DisputeRecord> activeDisputeMap) {
+        DisputeRecord activeDispute = activeDisputeMap.get(vo.getTaskId());
+        if (activeDispute == null) {
+            vo.setHasActiveDispute(false);
+            vo.setActiveDisputeId(null);
+            vo.setActiveDisputeStatus(null);
+            return;
+        }
+        vo.setHasActiveDispute(true);
+        vo.setActiveDisputeId(activeDispute.getRecordId());
+        vo.setActiveDisputeStatus(activeDispute.getHandleStatus());
+    }
+
+    private void fillLatestClosedDisputeInfo(ErrandVO vo, Map<Long, DisputeRecord> latestClosedDisputeMap) {
+        DisputeRecord latestClosedDispute = latestClosedDisputeMap.get(vo.getTaskId());
+        if (latestClosedDispute == null) {
+            vo.setLatestClosedDisputeId(null);
+            vo.setLatestClosedDisputeStatus(null);
+            vo.setLatestClosedDisputeResult(null);
+            vo.setLatestClosedDisputeRefundAmount(null);
+            vo.setLatestClosedDisputeCreditPenalty(null);
+            return;
+        }
+        vo.setLatestClosedDisputeId(latestClosedDispute.getRecordId());
+        vo.setLatestClosedDisputeStatus(latestClosedDispute.getHandleStatus());
+        vo.setLatestClosedDisputeResult(latestClosedDispute.getHandleResult());
+        vo.setLatestClosedDisputeRefundAmount(latestClosedDispute.getResolvedRefundAmount());
+        vo.setLatestClosedDisputeCreditPenalty(latestClosedDispute.getResolvedCreditPenalty());
+    }
+}
+
+
+
+

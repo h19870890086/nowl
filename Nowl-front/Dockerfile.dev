@@ -1,0 +1,22 @@
+# ==================== 开发环境 Dockerfile ====================
+
+# 开发阶段
+FROM node:20-alpine AS dev
+WORKDIR /app
+
+# 设置时区
+RUN apk add --no-cache tzdata && \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+
+# 复制依赖文件
+COPY package.json package-lock.json ./
+
+# 安装依赖
+RUN npm ci
+
+# 暴露 Vite 默认端口
+EXPOSE 5173
+
+# 开发命令（会被 docker-compose 覆盖）
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
